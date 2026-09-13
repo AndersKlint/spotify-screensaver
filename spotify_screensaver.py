@@ -37,6 +37,7 @@ bg_photo = None
 text_photo = None
 prev_title = None
 prev_artist = None
+last_player_gone = False
 DEBUG = False
 
 
@@ -63,27 +64,39 @@ def get_idle_time():
 
 
 def _playerctl(*args):
+    # stderr=DEVNULL: playerctl's own "No players found" message would
+    # otherwise spam the journal on every poll during an outage.
     return subprocess.check_output(
-        ["playerctl"] + list(args), timeout=5
+        ["playerctl"] + list(args), timeout=5, stderr=subprocess.DEVNULL
     ).decode().strip()
 
 
 def get_spotify_info():
-    """Return (title, artist, art_url). Works with deb/flatpak/snap Spotify."""
-    # Prefer the spotify player explicitly; fall back to default player.
-    for prefix in (["-p", "spotify"], []):
-        try:
-            title = _playerctl(*prefix, "metadata", "title")
-            artist = _playerctl(*prefix, "metadata", "artist")
-            art_url = _playerctl(*prefix, "metadata", "mpris:artUrl")
-            if title:
-                return title, artist, art_url
-        except FileNotFoundError:
-            log("ERROR: 'playerctl' not found. Is it installed? (sudo apt install playerctl)")
+    """Return (title, artist, art_url), or None if no player is reachable.
+
+    None means there is no MPRIS player on the bus at all (e.g. the Spotify
+    client crashed or lost its bus connection, as happens across suspend).
+    An answered-but-empty player still yields "Nothing Playing".
+    """
+    try:
+        # Prefer the spotify player explicitly; fall back to default player.
+        for prefix in (["-p", "spotify"], []):
+            try:
+                title = _playerctl(*prefix, "metadata", "title")
+                artist = _playerctl(*prefix, "metadata", "artist")
+                art_url = _playerctl(*prefix, "metadata", "mpris:artUrl")
+                if title:
+                    return title, artist, art_url
+            except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
+                continue
+        if _playerctl("-l"):
             return "Nothing Playing", "", ""
-        except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
-            continue
-    return "Nothing Playing", "", ""
+        return None
+    except FileNotFoundError:
+        log("ERROR: 'playerctl' not found. Is it installed? (sudo apt install playerctl)")
+        return None
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
+        return None
 
 
 def download_album_art(url):
@@ -301,8 +314,20 @@ def show_screensaver():
 
 
 def update_display():
-    global prev_title, prev_artist
-    title, artist, art_url = get_spotify_info()
+    global prev_title, prev_artist, last_player_gone
+    info = get_spotify_info()
+    if info is None:
+        player_gone = True
+        title, artist, art_url = (
+            "Spotify not responding", "restart the Spotify app", "")
+    else:
+        player_gone = False
+        title, artist, art_url = info
+    if player_gone != last_player_gone:
+        # Log outages once per transition, not on every 10s refresh.
+        log("lost contact with Spotify player (no MPRIS player found)"
+            if player_gone else "Spotify player back")
+        last_player_gone = player_gone
     if prev_title == title and prev_artist == artist:
         screensaver.after(10000, update_display)
         return
@@ -432,8 +457,13 @@ def run_diagnostics():
         f"XDG_SESSION_TYPE={os.environ.get('XDG_SESSION_TYPE')!r}")
     idle = get_idle_time()
     log(f"xprintidle: {idle}ms")
-    title, artist, art_url = get_spotify_info()
-    log(f"playerctl: title={title!r} artist={artist!r} artUrl={art_url!r}")
+    info = get_spotify_info()
+    if info is None:
+        log("playerctl: no MPRIS players found")
+        art_url = ""
+    else:
+        title, artist, art_url = info
+        log(f"playerctl: title={title!r} artist={artist!r} artUrl={art_url!r}")
     if art_url and not art_url.startswith("file://"):
         try:
             r = requests.get(art_url, timeout=5)

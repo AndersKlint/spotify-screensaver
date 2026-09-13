@@ -1,0 +1,12 @@
+[Unit]
+Description=Restart Spotify desktop client if lost across suspend/resume
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+ExecStart=/usr/bin/python3 -u /home/mor/spotify-screensaver/spotify_resume_fix.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target
