@@ -1,44 +1,44 @@
 #!/usr/bin/env python3
-"""Restart the Spotify desktop client after resume from suspend, if broken.
+"""Restart the Spotify desktop client after resume from suspend.
 
-Watches logind's PrepareForSleep signal via `gdbus monitor`. On resume,
-waits for the session bus to settle, then checks whether the Spotify
-MPRIS player is back. If (and only if) Spotify was running before suspend
-and is still missing afterwards, kills any leftover processes and
-relaunches it. The spotifyd daemon is never touched.
+Simple fixed sequence (no watchdog, no retry budgets):
+
+1. On resume, wait 1 min (let the session settle).
+2. Kill spotify.
+3. Wait 30 sec.
+4. Launch spotify again.
+5. After 2 more min, check the MPRIS player the screensaver uses
+   (`playerctl -l` contains "spotify"); if missing, restart again.
+6. After 5 more min, check again; if missing, restart again.
+7. Done.
+
+If Spotify was not running before suspend, nothing is done.
 
 Usage:
     spotify_resume_fix.py              # watch for resume events forever
-    spotify_resume_fix.py --check-now  # run one settle+verify+fix cycle now
+    spotify_resume_fix.py --check-now  # run the resume sequence once now
 """
 
-import os
 import shutil
-import signal
 import subprocess
 import sys
+import threading
 import time
 
 TAG = "spotify-resume-fix"
 
-SETTLE_DELAY_SEC = 15      # grace period after resume before first check
-VERIFY_TIMEOUT_SEC = 60    # how long to wait for MPRIS to reappear on its own
-VERIFY_POLL_SEC = 5
-KILL_TIMEOUT_SEC = 10      # SIGTERM -> SIGKILL escalation window
-RELAUNCH_TIMEOUT_SEC = 30  # how long to wait for MPRIS after relaunch
+WAIT_AFTER_RESUME_SEC = 60   # 1 min settle before touching spotify
+WAIT_AFTER_KILL_SEC = 30     # 30 sec between kill and relaunch
+FIRST_CHECK_DELAY_SEC = 120  # 2 min after relaunch: first health check
+SECOND_CHECK_DELAY_SEC = 300  # 5 min later: second health check
 
 
 def log(msg):
     print(f"[{TAG}] {msg}", flush=True)
 
 
-def run(args, **kwargs):
-    return subprocess.run(
-        args, capture_output=True, text=True, timeout=30, **kwargs)
-
-
 def spotify_on_bus():
-    """True if the Spotify desktop client's MPRIS player is reachable."""
+    """True if the Spotify MPRIS player (used by the screensaver) is up."""
     try:
         out = subprocess.check_output(
             ["playerctl", "-l"], timeout=10, stderr=subprocess.DEVNULL
@@ -49,68 +49,61 @@ def spotify_on_bus():
     return "spotify" in out.split()
 
 
-def spotify_pids():
-    """PIDs of processes named exactly 'spotify' (never 'spotifyd')."""
-    out = run(["pgrep", "-x", "spotify"]).stdout.strip()
-    return [int(p) for p in out.split()] if out else []
+def kill_spotify():
+    """Kill leftover spotify processes (never spotifyd)."""
+    log("killing spotify")
+    subprocess.run(["pkill", "-x", "spotify"],
+                   capture_output=True, timeout=30)
+    time.sleep(5)
+    # Escalate anything that survived SIGTERM.
+    subprocess.run(["pkill", "-9", "-x", "spotify"],
+                   capture_output=True, timeout=30)
 
 
-def wait_for_bus(want_present, timeout, poll=VERIFY_POLL_SEC):
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        if spotify_on_bus() == want_present:
-            return True
-        time.sleep(poll)
-    return spotify_on_bus() == want_present
-
-
-def fix_spotify():
-    """Kill leftovers (TERM, then KILL) and relaunch. True if MPRIS is back."""
-    pids = spotify_pids()
-    if pids:
-        log(f"leftover spotify processes found (pids={pids}), terminating")
-        for pid in pids:
-            try:
-                os.kill(pid, signal.SIGTERM)
-            except ProcessLookupError:
-                pass
-        deadline = time.monotonic() + KILL_TIMEOUT_SEC
-        while spotify_pids() and time.monotonic() < deadline:
-            time.sleep(0.5)
-        pids = spotify_pids()
-        if pids:
-            log(f"processes survived SIGTERM (pids={pids}), killing")
-            run(["pkill", "-9", "-x", "spotify"])
-            time.sleep(2)
-    else:
-        log("no spotify processes left, launching fresh copy")
+def launch_spotify():
+    """Launch the Spotify desktop client detached."""
     log("launching spotify")
     subprocess.Popen(
         ["spotify"], start_new_session=True,
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         stdin=subprocess.DEVNULL,
     )
-    if wait_for_bus(True, RELAUNCH_TIMEOUT_SEC):
-        log("Spotify player back on the bus")
+
+
+def restart_spotify():
+    """Kill, wait 30s, then launch again."""
+    kill_spotify()
+    log(f"waiting {WAIT_AFTER_KILL_SEC}s before relaunch")
+    time.sleep(WAIT_AFTER_KILL_SEC)
+    launch_spotify()
+
+
+def check_and_fix(label):
+    """Check MPRIS; restart once if the player is missing. Returns bool up."""
+    if spotify_on_bus():
+        log(f"check {label}: Spotify player up, nothing to do")
         return True
-    log("WARNING: relaunched Spotify but no MPRIS player appeared; "
-        "manual restart may be needed")
+    log(f"check {label}: Spotify player missing, restarting")
+    restart_spotify()
     return False
 
 
-def check_now():
-    """One settle+verify+fix cycle. True if the player is up afterwards."""
-    log(f"settling for {SETTLE_DELAY_SEC}s after resume")
-    time.sleep(SETTLE_DELAY_SEC)
-    if wait_for_bus(True, VERIFY_TIMEOUT_SEC):
-        log("Spotify player healthy after resume, nothing to do")
-        return True
-    log("Spotify player still missing after resume, restarting client")
-    return fix_spotify()
+def handle_resume():
+    """The full post-resume sequence. Blocks ~8.5 min, so run in a thread."""
+    log(f"resumed, waiting {WAIT_AFTER_RESUME_SEC}s before restart")
+    time.sleep(WAIT_AFTER_RESUME_SEC)
+    restart_spotify()
+    log(f"waiting {FIRST_CHECK_DELAY_SEC}s before first health check")
+    time.sleep(FIRST_CHECK_DELAY_SEC)
+    check_and_fix("first (2 min after relaunch)")
+    log(f"waiting {SECOND_CHECK_DELAY_SEC}s before second health check")
+    time.sleep(SECOND_CHECK_DELAY_SEC)
+    check_and_fix("second (5 min later)")
+    log("resume sequence done")
 
 
 def watch():
-    """Block on logind sleep signals forever; check on every resume."""
+    """Block on logind sleep signals forever; run the sequence per resume."""
     had_player_before_sleep = None
     proc = subprocess.Popen(
         ["gdbus", "monitor", "--system",
@@ -131,8 +124,9 @@ def watch():
                 if had_player_before_sleep is False:
                     log("Spotify was not running before suspend, "
                         "leaving it stopped")
-                elif not check_now():
-                    log("resume fix failed (see WARNING above)")
+                else:
+                    threading.Thread(
+                        target=handle_resume, daemon=True).start()
                 had_player_before_sleep = None
     finally:
         proc.terminate()
@@ -140,7 +134,8 @@ def watch():
 
 def main(argv):
     if "--check-now" in argv:
-        return 0 if check_now() else 1
+        handle_resume()
+        return 0
     if shutil.which("gdbus") is None:
         log("ERROR: 'gdbus' not found; cannot watch for resume events")
         return 3
