@@ -161,36 +161,91 @@ def download_album_art(url):
         log(f"Error loading album art: {e}")
 
 
-def _load_text_font(size, bold=False):
-    """Load a sans font for the track text. DejaVu ships with Mint."""
-    if bold:
+# Ranges that need a CJK-capable font (CJK radicals, kana, hangul,
+# unified ideographs, fullwidth forms and supplementary ideographs).
+CJK_RANGES = (
+    (0x1100, 0x11FF), (0x2E80, 0x2EFF), (0x3000, 0x303F),
+    (0x3040, 0x30FF), (0x3100, 0x312F), (0x3130, 0x318F),
+    (0x3190, 0x31FF), (0x3200, 0x4DBF), (0x4E00, 0x9FFF),
+    (0xA000, 0xA4CF), (0xAC00, 0xD7AF), (0xF900, 0xFAFF),
+    (0xFE30, 0xFE4F), (0xFF00, 0xFFEF), (0x20000, 0x2FA1F),
+)
+
+
+def _is_cjk_char(ch):
+    cp = ord(ch)
+    return any(start <= cp <= end for start, end in CJK_RANGES)
+
+
+def _load_text_font(size, bold=False, cjk=False):
+    """Load a sans font for the track text.
+
+    DejaVu (ships with Mint) is used for Latin text; blocks containing
+    CJK characters use Noto Sans CJK, which has the needed glyphs.
+    """
+    if cjk:
+        cjk_regular = "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc"
+        cjk_bold = "/usr/share/fonts/opentype/noto/NotoSansCJK-Bold.ttc"
+        # Index 2 is the Simplified Chinese face in the Noto CJK collection.
         candidates = [
-            "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
-            "DejaVuSans-Bold.ttf",
+            (cjk_bold if bold else cjk_regular, 2),
+            ("/usr/share/fonts/truetype/droid/DroidSansFallbackFull.ttf", 0),
+            (cjk_regular, 2),
+        ]
+    elif bold:
+        candidates = [
+            ("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 0),
+            ("DejaVuSans-Bold.ttf", 0),
         ]
     else:
         candidates = [
-            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-            "DejaVuSans.ttf",
+            ("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 0),
+            ("DejaVuSans.ttf", 0),
         ]
-    for path in candidates:
+    for path, index in candidates:
         try:
-            return ImageFont.truetype(path, size)
+            return ImageFont.truetype(path, size, index=index)
         except Exception:
             continue
     return ImageFont.load_default()
 
 
+def _text_tokens(text):
+    """Split text into break units as (token, space_before) pairs.
+
+    CJK characters are individual tokens so lines can wrap between them
+    even when the text has no spaces; other scripts stay whole words.
+    """
+    tokens = []
+    first_word = True
+    for word in text.split():
+        pieces, buffer = [], ""
+        for ch in word:
+            if _is_cjk_char(ch):
+                if buffer:
+                    pieces.append(buffer)
+                    buffer = ""
+                pieces.append(ch)
+            else:
+                buffer += ch
+        if buffer:
+            pieces.append(buffer)
+        for i, piece in enumerate(pieces):
+            tokens.append((piece, not first_word and i == 0))
+        first_word = False
+    return tokens
+
+
 def _wrap_text(draw, text, font, max_width):
-    words = text.split()
     lines, current = [], ""
-    for word in words:
-        trial = f"{current} {word}".strip()
+    for token, space_before in _text_tokens(text):
+        separator = " " if current and space_before else ""
+        trial = current + separator + token
         if draw.textlength(trial, font=font) <= max_width or not current:
             current = trial
         else:
             lines.append(current)
-            current = word
+            current = token
     if current:
         lines.append(current)
     return lines
@@ -203,8 +258,10 @@ def _layout_track_text(measurer, title, artist, max_width, title_size,
     Returns (laid_out, text_h) where laid_out is one
     (lines, font, line_height, width) tuple per block.
     """
-    title_font = _load_text_font(title_size, bold=True)
-    artist_font = _load_text_font(artist_size, bold=False)
+    title_font = _load_text_font(title_size, bold=True,
+                                 cjk=any(_is_cjk_char(c) for c in (title or "")))
+    artist_font = _load_text_font(artist_size, bold=False,
+                                  cjk=any(_is_cjk_char(c) for c in (artist or "")))
     blocks = [(title, title_font)]
     if artist:
         blocks.append((artist, artist_font))
@@ -330,7 +387,8 @@ def make_text_with_shadow(text, max_width, font_size=None, offset=None,
         blur = TEXT_SHADOW_BLUR
     if opacity is None:
         opacity = TEXT_SHADOW_OPACITY
-    font = _load_text_font(font_size)
+    font = _load_text_font(font_size,
+                           cjk=any(_is_cjk_char(c) for c in (text or "")))
     measurer = ImageDraw.Draw(Image.new("RGBA", (8, 8)))
     lines = _wrap_text(measurer, text, font, max_width)
     ascent, descent = font.getmetrics()
